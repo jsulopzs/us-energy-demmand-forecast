@@ -1,1 +1,7 @@
 .DS_Store
+metaflow
+.pdm-build
+.pdm-python
+dist/*
+us_energy_demmand_forecast/__pycache__
+scripts/.metaflow
