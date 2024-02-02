@@ -1,5 +1,5 @@
 .DS_Store
-metaflow
+.metaflow
 .pdm-build
 .pdm-python
 dist/*
