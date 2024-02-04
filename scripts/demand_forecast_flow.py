@@ -9,12 +9,13 @@ class DemandForecastFlow(FlowSpec):
     # Follow the docs to set up the app: https://nannyml.gitbook.io/cloud/deployment/azure/azure-managed-application
     NANNYML_CLOUD_INSTANCE_URL = Parameter('NANNYML_CLOUD_INSTANCE_URL')
     NANNYML_CLOUD_API_TOKEN = Parameter('NANNYML_CLOUD_API_TOKEN')
-
+    
     @step
     def start(self):
+        #?(TODO): Real time data from EIA API
         import pandas as pd
 
-        self.df_base = pd.read_csv('../data/general/pjm_pivot.csv', index_col=0, parse_dates=True)
+        self.df_regions = pd.read_csv('../data/general/pjm_pivot.csv', index_col=0, parse_dates=True)
         self.regions = ['AE', 'AEP', 'AP', 'ATSI', 'BC']
         # [ 'AE', 'AEP', 'AP', 'ATSI', 'BC', 'CE', 'DAY', 'DEOK', 'DOM', 'DPL', 
         # 'DUQ', 'EKPC', 'JC', 'ME', 'PE', 'PEP', 'PL', 'PN', 'PS', 'RECO']
@@ -25,39 +26,72 @@ class DemandForecastFlow(FlowSpec):
         from sklearn.model_selection import train_test_split
         import os
 
-        self.region = self.input
-        self.df = self.df_base.loc[:, [self.region]]
-        self.train, self.test = train_test_split(self.df, test_size=0.3, shuffle=False)
-        self.test, self.prod = train_test_split(self.test, test_size=0.5, shuffle=False)
-        self.path_region = f'../data/regions/{self.region}'
+        for region in self.regions:
+            
+            self.df = self.df_regions[region].to_frame()
+            train, prod = train_test_split(self.df, test_size=0.15, shuffle=False)
 
-        if not os.path.exists(self.path_region):
-            os.makedirs(self.path_region)
+            self.path_region = f'../data/regions/{region}'
+            if not os.path.exists(self.path_region):
+                os.makedirs(self.path_region)
 
-        for df, name in zip([self.train, self.test, self.prod], ['train', 'test', 'prod']):
-            df.to_csv(f'{self.path_region}/{name}.csv')
-        self.next(self.create_sequences)
+            for self.df, name in zip([train, prod], ['train', 'prod']):
+                self.df.to_csv(f'{self.path_region}/{name}.csv')
+        
+        self.next(self.preprocess_data)
 
     @step
-    def create_sequences(self):
+    def preprocess_data(self):
         from sklearn.preprocessing import MinMaxScaler
         from us_energy_demmand_forecast.utils import create_sequences
-
-        scaler = MinMaxScaler(feature_range=(0, 1))
-        self.train_norm = scaler.fit_transform(self.train)
-        self.test_norm = scaler.transform(self.test)
-        self.sequence_length = 24 # Use 24 hours prior to predict the following hour
-        self.X_train, self.y_train = create_sequences(self.train_norm, self.sequence_length)
-        self.X_test, self.y_test = create_sequences(self.test_norm, self.sequence_length)
-        self.X_prod, _ = create_sequences(self.test_norm, self.sequence_length)
-        self.next(self.train_model)
+        import joblib
+        import pandas as pd
+        
+        path_train = f'{self.path_region}/train.csv'
+        self.train = pd.read_csv(path_train, index_col=0, parse_dates=True)
+        
+        self.scaler = MinMaxScaler(feature_range=(0, 1))
+        self.scaler.fit(self.df)
+        
+        path_scaler = f'{self.path_region}/scaler.pkl'
+        joblib.dump(self.scaler, path_scaler)
+        
+        self.train_norm = self.scaler.fit_transform(self.train)
+        
+        self.n_windows = 24 # Use 24 hours prior to predict the following hour
+        self.X_train, self.y_train = create_sequences(self.train_norm, self.n_windows)
+        
+        #? to implement real time production, this part should be moved to the to nanny ml step function?
+        path_prod = f'{self.path_region}/prod.csv'
+        self.prod = pd.read_csv(path_prod, index_col=0, parse_dates=True)
+        self.prod_norm = self.scaler.transform(self.prod)
+        
+        self.X_prod, self.y_prod = create_sequences(self.prod_norm, self.n_windows)
+        
+        self.next(self.df_model)
 
     @step
     def train_model(self):
+        from sklearn.model_selection import TimeSeriesSplit
         from lightgbm import LGBMRegressor
-        self.model = LGBMRegressor(num_leaves=10, learning_rate=0.01, max_depth=5)
-        self.model.fit(self.X_train[:, :, 0], self.y_train, eval_metric='mae', eval_set=[(self.X_test[:, :, 0], self.y_test)])
-        self.model.booster_.save_model(f'../models/{self.region}_model.h5')
+        
+        tscv = TimeSeriesSplit(n_splits=5)
+
+        self.model = LGBMRegressor(
+            max_depth=5,
+            learning_rate=0.01,
+            num_leaves=10
+        )
+
+        for train_index, test_index in tscv.split(self.X):
+            X_train, X_test = self.X[train_index,:,0], self.X[test_index,:,0]
+            y_train, y_test = self.y[train_index,0], self.y[test_index,0]
+            
+            self.model.fit(X_train, y_train, eval_set=[(X_test, y_test)])
+            
+        path_model = f'{self.path_region}/model.txt'
+        self.model.booster_.save_model(path_model)
+        
         self.next(self.make_predictions)
     
     @step
@@ -128,7 +162,7 @@ class DemandForecastFlow(FlowSpec):
     @step
     def end(self):
         print('Demand forecast trained succesfully')
- 
+
 
 if __name__ == '__main__':
     DemandForecastFlow()
